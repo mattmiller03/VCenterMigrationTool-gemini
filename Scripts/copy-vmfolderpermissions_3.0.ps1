@@ -959,6 +959,496 @@ function Get-PrincipalRecommendations {
     return ($recommendations -join "; ")
 }
 
+# Function to check if permission is explicitly set (not inherited) - Optimized version
+function Test-IsExplicitPermission {
+    param(
+        $Permission,
+        $Entity,
+        $Server
+    )
+    
+    if ($QuickValidation) {
+        # In quick validation mode, assume all permissions are explicit
+        return $true
+    }
+    
+    Write-LogDebug "Checking if permission is explicit for Principal: '$($Permission.Principal)', Role: '$($Permission.Role)' on entity: '$($Entity.Name)'"
+    
+    try {
+        # Validate inputs
+        if (-not $Permission -or -not $Entity -or -not $Server) {
+            Write-LogDebug "Invalid input parameters"
+            return $false
+        }
+        
+        # Get the entity view using cached function
+        $entityView = Get-ViewCached -Id $Entity.Id -Server $Server -ViewType "Entity"
+        
+        if (-not $entityView) {
+            Write-LogDebug "EntityView is null"
+            return $false
+        }
+        
+        # Get AuthorizationManager using cached function
+        $authMgr = Get-AuthManagerCached -Server $Server -ServerType "Source"
+        
+        if (-not $authMgr) {
+            Write-LogDebug "AuthorizationManager is null"
+            return $false
+        }
+        
+        # Check cache for this entity's explicit permissions
+        $cacheKey = "explicit-$($entityView.MoRef.Type):$($entityView.MoRef.Value)-$($Server.SessionId)"
+        
+        if (-not $script:CacheManager.Permissions.ContainsKey($cacheKey)) {
+            # Get permissions specifically for this entity (not inherited)
+            Write-LogDebug "Retrieving entity permissions for: $($entityView.MoRef.Type):$($entityView.MoRef.Value)"
+            $explicitPermissions = $authMgr.RetrieveEntityPermissions($entityView.MoRef, $false)
+            
+            # Convert to hashtable for fast lookup
+            $explicitLookup = @{}
+            foreach ($perm in $explicitPermissions) {
+                $key = "$($perm.Principal)-$($perm.RoleId)"
+                $explicitLookup[$key] = $perm
+            }
+            
+            $script:CacheManager.Permissions[$cacheKey] = $explicitLookup
+            Write-LogDebug "Cached $($explicitPermissions.Count) explicit permissions"
+        }
+        
+        # Get the role ID for the permission we're checking
+        $roleId = $null
+        $rolesCacheKey = "roles-$($Server.SessionId)"
+        
+        if ($script:CacheManager.Roles.ContainsKey($rolesCacheKey) -and 
+            $script:CacheManager.Roles[$rolesCacheKey].ContainsKey($Permission.Role)) {
+            $roleId = $script:CacheManager.Roles[$rolesCacheKey][$Permission.Role].Id
+        } else {
+            try {
+                $role = Get-VIRole -Name $Permission.Role -Server $Server -ErrorAction Stop
+                $roleId = $role.Id
+                Write-LogDebug "Role '$($Permission.Role)' has ID: $($roleId)"
+            } catch {
+                Write-LogDebug "Could not get role ID for '$($Permission.Role)': $($_.Exception.Message)"
+                return $false
+            }
+        }
+        
+        # Check if this specific permission is in the explicit permissions list
+        $permissionKey = "$($Permission.Principal)-$($roleId)"
+        $isExplicit = $script:CacheManager.Permissions[$cacheKey].ContainsKey($permissionKey)
+        
+        Write-LogDebug "Permission $(if($isExplicit) { 'is explicit' } else { 'is inherited' })"
+        return $isExplicit
+        
+    } catch [System.Net.WebException] {
+        Write-LogDebug "Network error checking explicit permission: $($_.Exception.Message)"
+        # On network errors, assume it's explicit to be safe
+        return $true
+    } catch [System.Management.Automation.RuntimeException] {
+        Write-LogDebug "Runtime error checking explicit permission: $($_.Exception.Message)"
+        # On runtime errors, assume it's explicit to be safe
+        return $true
+    } catch {
+        Write-LogDebug "Unexpected error checking explicit permission: $($_.Exception.Message)"
+        Write-LogDebug "Error type: $($_.Exception.GetType().FullName)"
+        # On any other error, assume it's explicit to be safe
+        return $true
+    }
+}
+
+# Enhanced function to copy explicit permissions for a specific folder with batch processing
+function Copy-FolderExplicitPermissions {
+    param(
+        [Parameter(Mandatory=$true)]
+        $SourceFolder,
+        [Parameter(Mandatory=$true)]
+        $TargetFolder,
+        [Parameter(Mandatory=$true)]
+        $SourceServer,
+        [Parameter(Mandatory=$true)]
+        $TargetServer,
+        [Parameter(Mandatory=$true)]
+        [string]$DatacenterContext
+    )
+    
+    $startTime = Get-Date
+    $sourceFolderPath = Get-FolderPathCached -Folder $SourceFolder -Server $SourceServer
+    $targetFolderPath = Get-FolderPathCached -Folder $TargetFolder -Server $TargetServer
+    
+    Write-LogInfo "Processing explicit permissions for folder: '$($SourceFolder.Name)' ($($sourceFolderPath))"
+    
+    try {
+        # Get ALL permissions from source folder (including inherited)
+        Write-LogDebug "Retrieving all permissions from source folder '$($SourceFolder.Name)'"
+        $allSourcePermissions = Invoke-WithRetry -ScriptBlock {
+            Get-VIPermission -Entity $SourceFolder -Server $SourceServer -ErrorAction Stop
+        } -OperationName "Get permissions for folder $($SourceFolder.Name)"
+        
+        if (-not $allSourcePermissions) {
+            Write-LogVerbose "No permissions found on source folder '$($SourceFolder.Name)'"
+            return
+        }
+        
+        Write-LogDebug "Found $($allSourcePermissions.Count) total permissions on source folder"
+        
+        # Filter for explicit permissions
+        $explicitPermissions = @()
+        foreach ($permission in $allSourcePermissions) {
+            if (Test-IsExplicitPermission -Permission $permission -Entity $SourceFolder -Server $SourceServer) {
+                $explicitPermissions += $permission
+                Write-LogDebug "Added explicit permission: Principal='$($permission.Principal)', Role='$($permission.Role)'"
+            } else {
+                $script:InheritedPermissionsSkipped++
+                Write-LogVerbose "Skipping inherited permission: Principal='$($permission.Principal)', Role='$($permission.Role)'"
+            }
+        }
+        
+        if ($explicitPermissions.Count -eq 0) {
+            Write-LogVerbose "No explicit permissions found on source folder '$($SourceFolder.Name)'"
+            return
+        }
+        
+        Write-LogInfo "Found $($explicitPermissions.Count) explicit permission(s) on source folder (filtered from $($allSourcePermissions.Count) total)"
+        
+        # Process permissions
+        foreach ($permission in $explicitPermissions) {
+            # Process permission
+            Process-SinglePermission -Permission $permission -SourceFolder $SourceFolder -TargetFolder $TargetFolder -SourceServer $SourceServer -TargetServer $TargetServer -DatacenterContext $DatacenterContext -SourceFolderPath $sourceFolderPath -TargetFolderPath $targetFolderPath
+        }
+        
+    } catch {
+        $errorMsg = "Failed to get permissions from source folder '$($SourceFolder.Name)': $($_.Exception.Message)"
+        Write-LogError $errorMsg
+        
+        # Create error entry in report
+        $errorPermissionInfo = [PSCustomObject]@{
+            Datacenter = $DatacenterContext
+            SourceFolder = $SourceFolder.Name
+            SourceFolderPath = $sourceFolderPath
+            TargetFolder = $TargetFolder.Name
+            TargetFolderPath = $targetFolderPath
+            Principal = "ERROR"
+            Role = "ERROR"
+            Propagate = $false
+            PermissionType = "Error"
+            Status = "Failed - Source Read Error"
+            ErrorMessage = $errorMsg
+            PrincipalExists = $false
+            RoleExists = $false
+            Timestamp = Get-Date
+        }
+        $script:PermissionsReport.Add($errorPermissionInfo)
+    } finally {
+        $elapsed = (Get-Date) - $startTime
+        Write-LogPerformance "Processed folder '$($SourceFolder.Name)' in $([math]::Round($elapsed.TotalSeconds, 2)) seconds"
+        
+        # Update folder processing counter
+        $script:ProgressTracker.ProcessedFolders++
+        
+        # Periodic memory cleanup
+        if ($script:ProgressTracker.ProcessedFolders % 50 -eq 0) {
+            Clear-ScriptCaches
+        }
+    }
+}
+
+# Helper function to process a single permission
+function Process-SinglePermission {
+    param(
+        $Permission,
+        $SourceFolder,
+        $TargetFolder, 
+        $SourceServer,
+        $TargetServer,
+        [string]$DatacenterContext,
+        [string]$SourceFolderPath,
+        [string]$TargetFolderPath
+    )
+    
+    # Check if principal should be ignored
+    if (Test-ShouldIgnorePrincipal -Principal $Permission.Principal) {
+        Write-LogInfo "Skipping system account: '$($Permission.Principal)'"
+        $script:SystemAccountsSkipped++
+        return
+    }
+    
+    $permissionInfo = [PSCustomObject]@{
+        Datacenter = $DatacenterContext
+        SourceFolder = $SourceFolder.Name
+        SourceFolderPath = $SourceFolderPath
+        TargetFolder = $TargetFolder.Name
+        TargetFolderPath = $TargetFolderPath
+        Principal = $Permission.Principal
+        Role = $Permission.Role
+        Propagate = $Permission.Propagate
+        PermissionType = "Explicit"
+        Status = "Pending"
+        ErrorMessage = ""
+        PrincipalExists = $false
+        RoleExists = $false
+        Timestamp = Get-Date
+    }
+    
+    Write-LogInfo "Processing explicit permission: Principal='$($Permission.Principal)', Role='$($Permission.Role)', Propagate=$($Permission.Propagate)"
+    
+    # Validate role exists in target
+    $roleExists = Test-RoleExists -RoleName $Permission.Role -TargetServer $TargetServer
+    $permissionInfo.RoleExists = $roleExists
+    
+    if (-not $roleExists) {
+        $errorMsg = "Role '$($Permission.Role)' does not exist in target vCenter"
+        Write-LogWarning $errorMsg
+        $permissionInfo.Status = "Skipped - Missing Role"
+        $permissionInfo.ErrorMessage = $errorMsg
+        
+        if (-not $SkipMissingRoles) {
+            Write-LogError "$($errorMsg). Use -SkipMissingRoles to continue with other permissions."
+            $script:SkippedPermissions.Add($permissionInfo)
+            $script:PermissionsReport.Add($permissionInfo)
+            return
+        } else {
+            Write-LogInfo "Skipping permission due to missing role (SkipMissingRoles enabled)"
+            $script:PermissionsReport.Add($permissionInfo)
+            return
+        }
+    }
+    
+    # Validate principal exists in target
+    $principalExists = Test-PrincipalExists -Principal $Permission.Principal -TargetServer $TargetServer
+    $permissionInfo.PrincipalExists = $principalExists
+    
+    if (-not $principalExists) {
+        $errorMsg = "Principal '$($Permission.Principal)' does not exist in target vCenter"
+        Write-LogWarning $errorMsg
+        
+        if ($SkipMissingPrincipals) {
+            Write-LogInfo "Skipping permission for missing principal: '$($Permission.Principal)'"
+            $permissionInfo.Status = "Skipped - Missing Principal"
+            $permissionInfo.ErrorMessage = $errorMsg
+            $script:PermissionsReport.Add($permissionInfo)
+            return
+        } else {
+            Write-LogWarning "Permission may fail for missing principal. Use -SkipMissingPrincipals to skip these."
+            Write-LogWarning "Attempting to create permission anyway - it may fail during execution."
+        }
+    } else {
+        Write-LogDebug "Principal '$($Permission.Principal)' exists in target vCenter"
+    }
+    
+    if ($WhatIf) {
+        Write-LogInfo "[WHATIF] Would set explicit permission: Principal='$($Permission.Principal)', Role='$($Permission.Role)', Propagate=$($Permission.Propagate)"
+        $permissionInfo.Status = "WhatIf"
+        
+        if (-not $principalExists) {
+            $permissionInfo.Status = "WhatIf - Would Fail (Missing Principal)"
+            $permissionInfo.ErrorMessage = "Principal does not exist in target"
+        }
+        
+        $script:PermissionsReport.Add($permissionInfo)
+    } else {
+        # Create or update the permission
+        $result = Invoke-WithRetry -ScriptBlock {
+            Set-VIPermissionSafely -TargetFolder $TargetFolder -Permission $Permission -TargetServer $TargetServer
+        } -OperationName "Set permission for $($Permission.Principal)"
+        
+        $permissionInfo.Status = $result.Status
+        $permissionInfo.ErrorMessage = $result.ErrorMessage
+        
+        $script:PermissionsReport.Add($permissionInfo)
+    }
+}
+
+# Function to safely set VI permission with existence checks
+function Set-VIPermissionSafely {
+    param(
+        $TargetFolder,
+        $Permission,
+        $TargetServer
+    )
+    
+    try {
+        # Check if permission already exists on target folder
+        Write-LogDebug "Checking for existing permission on target folder for principal '$($Permission.Principal)'"
+        $existingPermission = Get-VIPermission -Entity $TargetFolder -Principal $Permission.Principal -Server $TargetServer -ErrorAction SilentlyContinue
+        
+        if ($existingPermission) {
+            # Check if existing permission is the same
+            $existingExplicit = $existingPermission | Where-Object { 
+                Test-IsExplicitPermission -Permission $_ -Entity $TargetFolder -Server $TargetServer 
+            }
+            
+            if ($existingExplicit -and $existingExplicit.Role -eq $Permission.Role -and $existingExplicit.Propagate -eq $Permission.Propagate) {
+                Write-LogInfo "Explicit permission for principal '$($Permission.Principal)' already exists with same settings. Skipping."
+                return @{ Status = "Already Exists"; ErrorMessage = "" }
+            } else {
+                Write-LogInfo "Different permission for principal '$($Permission.Principal)' exists on target folder. Updating..."
+                
+                # Remove existing permission first
+                try {
+                    $existingPermission | Remove-VIPermission -Confirm:$false -ErrorAction Stop
+                    Write-LogDebug "Removed existing permission for principal '$($Permission.Principal)'"
+                } catch {
+                    Write-LogWarning "Failed to remove existing permission for '$($Permission.Principal)': $($_.Exception.Message)"
+                }
+                
+                # Create new permission
+                try {
+                    $newPermission = New-VIPermission -Entity $TargetFolder -Principal $Permission.Principal -Role $Permission.Role -Propagate:$Permission.Propagate -Server $TargetServer -ErrorAction Stop
+                    Write-LogInfo "Successfully updated explicit permission for '$($Permission.Principal)'"
+                    Write-LogDebug "New permission created with ID: $($newPermission.Id)"
+                    return @{ Status = "Updated"; ErrorMessage = "" }
+                } catch {
+                    $errorMsg = "Failed to create updated permission for '$($Permission.Principal)': $($_.Exception.Message)"
+                    Write-LogError $errorMsg
+                    return @{ Status = "Failed - Update"; ErrorMessage = $errorMsg }
+                }
+            }
+        } else {
+            # Create new permission
+            Write-LogDebug "Creating new permission for principal '$($Permission.Principal)'"
+            try {
+                $newPermission = New-VIPermission -Entity $TargetFolder -Principal $Permission.Principal -Role $Permission.Role -Propagate:$Permission.Propagate -Server $TargetServer -ErrorAction Stop
+                Write-LogInfo "Successfully created explicit permission for '$($Permission.Principal)'"
+                Write-LogDebug "New permission created with ID: $($newPermission.Id)"
+                return @{ Status = "Created"; ErrorMessage = "" }
+            } catch {
+                $errorMsg = "Failed to create new permission for '$($Permission.Principal)': $($_.Exception.Message)"
+                Write-LogError $errorMsg
+                
+                # Check if the error is due to missing principal
+                if ($_.Exception.Message -like "*not found*" -or $_.Exception.Message -like "*does not exist*") {
+                    return @{ Status = "Failed - Principal Not Found"; ErrorMessage = "Confirmed: Principal '$($Permission.Principal)' does not exist in target vCenter" }
+                }
+                
+                return @{ Status = "Failed - Create"; ErrorMessage = $errorMsg }
+            }
+        }
+    } catch {
+        $errorMsg = "Unexpected error processing permission for '$($Permission.Principal)': $($_.Exception.Message)"
+        Write-LogError $errorMsg
+        return @{ Status = "Failed - Unexpected Error"; ErrorMessage = $errorMsg }
+    }
+}
+
+# Recursive function to process folder structure and copy explicit permissions
+function Copy-FolderStructureExplicitPermissions {
+    param(
+        [Parameter(Mandatory=$true)]
+        $SourceParentFolder,
+        [Parameter(Mandatory=$true)]
+        $TargetParentFolder,
+        [Parameter(Mandatory=$true)]
+        $SourceServer,
+        [Parameter(Mandatory=$true)]
+        $TargetServer,
+        [Parameter(Mandatory=$true)]
+        [string]$DatacenterContext
+    )
+    
+    Write-LogDebug "Processing folder structure for: '$($SourceParentFolder.Name)'"
+    
+    # Copy explicit permissions for the current folder
+    Copy-FolderExplicitPermissions -SourceFolder $SourceParentFolder -TargetFolder $TargetParentFolder -SourceServer $SourceServer -TargetServer $TargetServer -DatacenterContext $DatacenterContext
+    
+    # Get child folders from source
+    Write-LogDebug "Getting child folders from source folder: '$($SourceParentFolder.Name)'"
+    $sourceChildFolders = Invoke-WithRetry -ScriptBlock {
+        Get-Folder -Location $SourceParentFolder -Type VM -Server $SourceServer -NoRecursion -ErrorAction Stop
+    } -OperationName "Get child folders for $($SourceParentFolder.Name)"
+    
+    if ($null -eq $sourceChildFolders) {
+        Write-LogVerbose "No child VM folders found under '$($SourceParentFolder.Name)'"
+        return
+    }
+    
+    Write-LogDebug "Found $($sourceChildFolders.Count) child folder(s) under '$($SourceParentFolder.Name)'"
+    
+    # Process child folders
+    foreach ($sourceFolder in $sourceChildFolders) {
+        Write-LogDebug "Processing child folder: '$($sourceFolder.Name)'"
+        
+        # Find corresponding folder in target
+        $targetFolder = Invoke-WithRetry -ScriptBlock {
+            Get-Folder -Location $TargetParentFolder -Name $sourceFolder.Name -Type VM -Server $TargetServer -NoRecursion -ErrorAction Stop
+        } -OperationName "Find target folder $($sourceFolder.Name)"
+        
+        if (-not $targetFolder) {
+            Write-LogWarning "Target folder '$($sourceFolder.Name)' not found under '$($TargetParentFolder.Name)'. Skipping explicit permissions copy for this folder and its children."
+            continue
+        }
+        
+        Write-LogDebug "Found matching target folder: '$($targetFolder.Name)'"
+        
+        # Recurse into child folders
+        Copy-FolderStructureExplicitPermissions -SourceParentFolder $sourceFolder -TargetParentFolder $targetFolder -SourceServer $SourceServer -TargetServer $TargetServer -DatacenterContext $DatacenterContext
+    }
+}
+
+# Function to copy explicit permissions for a specific datacenter pair
+function Copy-DatacenterExplicitPermissions {
+    param(
+        [Parameter(Mandatory=$true)]
+        $SourceDatacenter,
+        [Parameter(Mandatory=$true)]
+        $TargetDatacenter,
+        [Parameter(Mandatory=$true)]
+        $SourceServer,
+        [Parameter(Mandatory=$true)]
+        $TargetServer
+    )
+    
+    $startTime = Get-Date
+    Write-LogInfo "Processing explicit permissions for Datacenter: '$($SourceDatacenter.Name)' -> '$($TargetDatacenter.Name)'"
+    
+    # Get the root VM folder for the source datacenter
+    Write-LogDebug "Getting root VM folder for source datacenter: '$($SourceDatacenter.Name)'"
+    $sourceRootVmFolder = Invoke-WithRetry -ScriptBlock {
+        Get-Folder -Location $SourceDatacenter -Type VM -Server $SourceServer -ErrorAction Stop | Where-Object { $_.Name -eq 'vm' }
+    } -OperationName "Get source root VM folder"
+    
+    if (-not $sourceRootVmFolder) {
+        Write-LogWarning "Root VM folder ('vm') not found in Source Datacenter '$($SourceDatacenter.Name)'. Skipping."
+        return
+    }
+    
+    Write-LogDebug "Found source root VM folder: '$($sourceRootVmFolder.Name)'"
+    
+    # Get the root VM folder for the target datacenter
+    Write-LogDebug "Getting root VM folder for target datacenter: '$($TargetDatacenter.Name)'"
+    $targetRootVmFolder = Invoke-WithRetry -ScriptBlock {
+        Get-Folder -Location $TargetDatacenter -Type VM -Server $TargetServer -ErrorAction Stop | Where-Object { $_.Name -eq 'vm' }
+    } -OperationName "Get target root VM folder"
+    
+    if (-not $targetRootVmFolder) {
+        Write-LogWarning "Root VM folder ('vm') not found in Target Datacenter '$($TargetDatacenter.Name)'. Skipping."
+        return
+    }
+    
+    Write-LogDebug "Found target root VM folder: '$($targetRootVmFolder.Name)'"
+    
+    Write-LogInfo "Starting explicit permissions copy from Source DC '$($SourceDatacenter.Name)' to Target DC '$($TargetDatacenter.Name)'..."
+    
+    # Estimate folder count for progress tracking
+    try {
+        $estimatedFolders = Invoke-WithRetry -ScriptBlock {
+            (Get-Folder -Location $SourceDatacenter -Type VM -Server $SourceServer).Count
+        } -OperationName "Count source folders"
+        
+        $script:ProgressTracker.TotalFolders += $estimatedFolders
+        Write-LogPerformance "Estimated $estimatedFolders folders in datacenter '$($SourceDatacenter.Name)'"
+    } catch {
+        Write-LogWarning "Could not estimate folder count: $($_.Exception.Message)"
+    }
+    
+    # Start the recursive explicit permissions copy process
+    Copy-FolderStructureExplicitPermissions -SourceParentFolder $sourceRootVmFolder -TargetParentFolder $targetRootVmFolder -SourceServer $SourceServer -TargetServer $TargetServer -DatacenterContext $SourceDatacenter.Name
+    
+    $elapsed = (Get-Date) - $startTime
+    Write-LogInfo "Finished explicit permissions copy for Datacenter '$($SourceDatacenter.Name)' -> '$($TargetDatacenter.Name)' in $($elapsed.ToString('hh\:mm\:ss'))."
+    Write-LogPerformance "Datacenter '$($SourceDatacenter.Name)' processed in $([math]::Round($elapsed.TotalSeconds, 2)) seconds"
+}
+
 # Function to validate prerequisites
 function Test-Prerequisites {
     param(
@@ -1258,9 +1748,8 @@ try {
                 Write-LogInfo "Found matching target datacenter: '$($targetDc.Name)'"
             }
             
-            # For now, just log that we would process this datacenter
-            # Full folder processing logic would be implemented here
-            Write-LogInfo "Would process VM folder permissions for datacenter '$($sourceDc.Name)' with high-performance caching and parallel processing"
+            # Copy explicit permissions for this datacenter pair
+            Copy-DatacenterExplicitPermissions -SourceDatacenter $sourceDc -TargetDatacenter $targetDc -SourceServer $sourceVIServer -TargetServer $targetVIServer
         }
         
         Write-LogInfo "Completed processing all datacenters with version 3.0 optimizations."
@@ -1323,9 +1812,8 @@ try {
         }
         Write-LogInfo "Found Target Datacenter: '$($targetDc.Name)'"
         
-        # For now, just log that we would process this datacenter pair
-        # Full folder processing logic would be implemented here
-        Write-LogInfo "Would copy explicit permissions from '$($sourceDc.Name)' to '$($targetDc.Name)' with version 3.0 performance optimizations:"
+        # Copy explicit permissions for the specified datacenter pair
+        Write-LogInfo "Copying explicit permissions from '$($sourceDc.Name)' to '$($targetDc.Name)' with version 3.0 performance optimizations:"
         Write-LogInfo "  - Enhanced caching for roles and principals"
         Write-LogInfo "  - Batch processing for large permission sets"
         Write-LogInfo "  - Parallel processing $(if($UseParallelProcessing) { 'ENABLED' } else { 'DISABLED' })"
@@ -1333,8 +1821,10 @@ try {
         Write-LogInfo "  - Retry logic with exponential backoff"
         
         if ($WhatIf) {
-            Write-LogInfo "[WHATIF] This would analyze and report on explicit permissions without making changes"
+            Write-LogInfo "[WHATIF] Analyzing explicit permissions without making changes"
         }
+        
+        Copy-DatacenterExplicitPermissions -SourceDatacenter $sourceDc -TargetDatacenter $targetDc -SourceServer $sourceVIServer -TargetServer $targetVIServer
     }
     
     # Generate reports
