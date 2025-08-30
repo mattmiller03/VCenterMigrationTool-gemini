@@ -1082,6 +1082,21 @@ function Copy-FolderExplicitPermissions {
     $sourceFolderPath = Get-FolderPathCached -Folder $SourceFolder -Server $SourceServer
     $targetFolderPath = Get-FolderPathCached -Folder $TargetFolder -Server $TargetServer
     
+    # Check if this is a system folder that cannot have explicit permissions
+    $systemFolders = @("host", "network", "datastore", "vm")
+    if ($systemFolders -contains $SourceFolder.Name.ToLower()) {
+        # Check if it's a direct child of datacenter
+        try {
+            $parent = Get-View -Id $SourceFolder.Parent -Property Name,Parent -Server $SourceServer -ErrorAction SilentlyContinue
+            if ($parent.PSObject.TypeNames -contains "VMware.Vim.Datacenter") {
+                Write-LogInfo "Skipping datacenter system folder '$($SourceFolder.Name)' - these folders inherit permissions from datacenter"
+                return
+            }
+        } catch {
+            Write-LogDebug "Could not determine parent type for folder '$($SourceFolder.Name)' - proceeding with permission check"
+        }
+    }
+    
     Write-LogInfo "Processing explicit permissions for folder: '$($SourceFolder.Name)' ($($sourceFolderPath))"
     
     try {
@@ -1274,6 +1289,28 @@ function Set-VIPermissionSafely {
     )
     
     try {
+        # Check if this is a system folder that cannot have explicit permissions
+        # The 'vm' folder is a direct child of datacenter and always inherits permissions
+        if ($TargetFolder.Name -eq "vm" -and $TargetFolder.Parent.Type -eq "Datacenter") {
+            Write-LogWarning "Skipping system folder 'vm' (VMs and Templates) - this folder always inherits permissions from its parent datacenter"
+            return @{ Status = "Skipped - System Folder"; ErrorMessage = "System folder 'vm' always inherits from datacenter" }
+        }
+        
+        # Check for other system folders that cannot have explicit permissions
+        $systemFolders = @("host", "network", "datastore", "vm")
+        if ($systemFolders -contains $TargetFolder.Name.ToLower()) {
+            # Verify if it's a direct child of datacenter
+            try {
+                $parent = Get-View -Id $TargetFolder.Parent -Property Name,Parent -Server $TargetServer -ErrorAction SilentlyContinue
+                if ($parent.PSObject.TypeNames -contains "VMware.Vim.Datacenter") {
+                    Write-LogWarning "Skipping datacenter system folder '$($TargetFolder.Name)' - these folders always inherit permissions from the datacenter"
+                    return @{ Status = "Skipped - Datacenter System Folder"; ErrorMessage = "Datacenter system folder always inherits permissions" }
+                }
+            } catch {
+                Write-LogDebug "Could not determine parent type for folder '$($TargetFolder.Name)' - proceeding with permission copy"
+            }
+        }
+        
         # Check if permission already exists on target folder
         Write-LogDebug "Checking for existing permission on target folder for principal '$($Permission.Principal)'"
         $existingPermission = Get-VIPermission -Entity $TargetFolder -Principal $Permission.Principal -Server $TargetServer -ErrorAction SilentlyContinue
@@ -1307,6 +1344,13 @@ function Set-VIPermissionSafely {
                 } catch {
                     $errorMsg = "Failed to create updated permission for '$($Permission.Principal)': $($_.Exception.Message)"
                     
+                    # Check for system folder error during update
+                    if ($_.Exception.Message -like "*direct child folder of a datacenter*" -or 
+                        $_.Exception.Message -like "*always has the same permissions as its parent*") {
+                        Write-LogWarning "Cannot update explicit permissions on system folder '$($TargetFolder.Name)' - it inherits from datacenter"
+                        return @{ Status = "Skipped - System Folder Update"; ErrorMessage = "System folder inherits from datacenter" }
+                    }
+                    
                     # Enhanced error analysis for updates too
                     if ($_.Exception.Message -like "*authorization.modifypermissions*" -or $_.Exception.Message -like "*access*denied*" -or $_.Exception.Message -like "*insufficient*privileges*") {
                         Write-LogError "PRIVILEGE ERROR (Update): $errorMsg"
@@ -1334,6 +1378,13 @@ function Set-VIPermissionSafely {
                 return @{ Status = "Created"; ErrorMessage = "" }
             } catch {
                 $errorMsg = "Failed to create new permission for '$($Permission.Principal)': $($_.Exception.Message)"
+                
+                # Check for system folder error
+                if ($_.Exception.Message -like "*direct child folder of a datacenter*" -or 
+                    $_.Exception.Message -like "*always has the same permissions as its parent*") {
+                    Write-LogWarning "Cannot set explicit permissions on system folder '$($TargetFolder.Name)' - it inherits from datacenter"
+                    return @{ Status = "Skipped - System Folder"; ErrorMessage = "System folder inherits from datacenter" }
+                }
                 
                 # Enhanced error analysis and guidance
                 if ($_.Exception.Message -like "*not found*" -or $_.Exception.Message -like "*does not exist*") {
