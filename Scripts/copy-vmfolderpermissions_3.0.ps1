@@ -36,6 +36,8 @@
     Switch parameter: Skip permissions for users/groups that don't exist in target vCenter instead of failing.
 .PARAMETER SkipMissingRoles
     Switch parameter: Skip permissions for roles that don't exist in target vCenter instead of failing.
+.PARAMETER SkipPrivilegeErrors
+    Switch parameter: Skip permissions that fail due to insufficient privileges instead of halting.
 .PARAMETER WhatIf
     Switch parameter: Show what permissions would be copied without actually applying them.
 .PARAMETER CreateReport
@@ -154,6 +156,9 @@ param(
     
     [Parameter(Mandatory=$false)]
     [switch]$SkipMissingRoles,
+
+    [Parameter(Mandatory=$false)]
+    [switch]$SkipPrivilegeErrors,
     
     [Parameter(Mandatory=$false)]
     [switch]$WhatIf,
@@ -630,6 +635,7 @@ function Initialize-Logging {
     Write-LogInfo "  Retry Attempts: $($RetryAttempts)"
     Write-LogInfo "  Skip Missing Principals: $($SkipMissingPrincipals)"
     Write-LogInfo "  Skip Missing Roles: $($SkipMissingRoles)"
+    Write-LogInfo "  Skip Privilege Errors: $($SkipPrivilegeErrors)"
     Write-LogInfo "  Create Missing Principals: $($CreateMissingPrincipals)"
     if ($CreateMissingPrincipals) {
         Write-LogInfo "  Principal Creation Mode: $(if($CreateAsLocalAccounts) { 'Local SSO' } else { 'External Identity Source' })"
@@ -1300,8 +1306,22 @@ function Set-VIPermissionSafely {
                     return @{ Status = "Updated"; ErrorMessage = "" }
                 } catch {
                     $errorMsg = "Failed to create updated permission for '$($Permission.Principal)': $($_.Exception.Message)"
-                    Write-LogError $errorMsg
-                    return @{ Status = "Failed - Update"; ErrorMessage = $errorMsg }
+                    
+                    # Enhanced error analysis for updates too
+                    if ($_.Exception.Message -like "*authorization.modifypermissions*" -or $_.Exception.Message -like "*access*denied*" -or $_.Exception.Message -like "*insufficient*privileges*") {
+                        Write-LogError "PRIVILEGE ERROR (Update): $errorMsg"
+                        Write-LogError "Insufficient privileges to update permission on folder '$($TargetFolder.Name)'"
+                        
+                        if ($SkipPrivilegeErrors) {
+                            Write-LogWarning "Skipping permission update due to privilege error (SkipPrivilegeErrors enabled)"
+                            return @{ Status = "Skipped - Update Insufficient Privileges"; ErrorMessage = "Access denied during permission update (skipped)" }
+                        } else {
+                            return @{ Status = "Failed - Update Insufficient Privileges"; ErrorMessage = "Access denied during permission update" }
+                        }
+                    } else {
+                        Write-LogError $errorMsg
+                        return @{ Status = "Failed - Update"; ErrorMessage = $errorMsg }
+                    }
                 }
             }
         } else {
@@ -1314,14 +1334,42 @@ function Set-VIPermissionSafely {
                 return @{ Status = "Created"; ErrorMessage = "" }
             } catch {
                 $errorMsg = "Failed to create new permission for '$($Permission.Principal)': $($_.Exception.Message)"
-                Write-LogError $errorMsg
                 
-                # Check if the error is due to missing principal
+                # Enhanced error analysis and guidance
                 if ($_.Exception.Message -like "*not found*" -or $_.Exception.Message -like "*does not exist*") {
+                    Write-LogError $errorMsg
                     return @{ Status = "Failed - Principal Not Found"; ErrorMessage = "Confirmed: Principal '$($Permission.Principal)' does not exist in target vCenter" }
+                } elseif ($_.Exception.Message -like "*authorization.modifypermissions*" -or $_.Exception.Message -like "*access*denied*" -or $_.Exception.Message -like "*insufficient*privileges*") {
+                    Write-LogError "PRIVILEGE ERROR: $errorMsg"
+                    Write-LogError "Required Privileges Missing:"
+                    Write-LogError "  Your user account needs 'Authorization.ModifyPermissions' privilege on:"
+                    Write-LogError "  - The target VM folder: '$($TargetFolder.Name)'"
+                    Write-LogError "  - Or higher-level parent folder with inheritance"
+                    Write-LogError "  - Or global 'Administrator' role"
+                    Write-LogError ""
+                    Write-LogError "Solutions:"
+                    Write-LogError "  1. Run script with Administrator account"
+                    Write-LogError "  2. Grant current user 'Administrator' role"
+                    Write-LogError "  3. Create custom role with required privileges:"
+                    Write-LogError "     - Global.Permissions"
+                    Write-LogError "     - Authorization.ModifyPermissions" 
+                    Write-LogError "     - Folder.ModifyPermissions"
+                    Write-LogError "  4. Use -SkipMissingPrincipals to skip failed permissions"
+                    Write-LogError "  5. Use -WhatIf to identify all issues before attempting changes"
+                    
+                    if ($SkipPrivilegeErrors) {
+                        Write-LogWarning "Skipping permission due to privilege error (SkipPrivilegeErrors enabled)"
+                        return @{ Status = "Skipped - Insufficient Privileges"; ErrorMessage = "Access denied - insufficient privileges (skipped)" }
+                    } else {
+                        return @{ Status = "Failed - Insufficient Privileges"; ErrorMessage = "Access denied - insufficient privileges to modify permissions on folder '$($TargetFolder.Name)'" }
+                    }
+                } elseif ($_.Exception.Message -like "*invalid*role*") {
+                    Write-LogError $errorMsg
+                    return @{ Status = "Failed - Invalid Role"; ErrorMessage = "Role '$($Permission.Role)' is invalid or not found in target vCenter" }
+                } else {
+                    Write-LogError $errorMsg
+                    return @{ Status = "Failed - Create"; ErrorMessage = $errorMsg }
                 }
-                
-                return @{ Status = "Failed - Create"; ErrorMessage = $errorMsg }
             }
         }
     } catch {
@@ -1479,6 +1527,56 @@ function Test-Prerequisites {
     } catch {
         Write-LogError "Target vCenter: Cannot access AuthorizationManager or Roles. Check permissions. Error: $($_.Exception.Message)"
         return $false
+    }
+    
+    # Test permission modification privileges on target
+    Write-LogInfo "Testing permission modification privileges on target vCenter..."
+    try {
+        # Get current user's effective permissions
+        $currentUser = $TargetServer.User
+        Write-LogDebug "Testing privileges for user: $currentUser"
+        
+        # Try to get root folder to test permissions
+        $rootFolder = Get-Folder -Name "Datacenters" -Server $TargetServer -ErrorAction Stop
+        
+        # Check if we can read permissions on root folder (this tests basic access)
+        $testPermissions = Get-VIPermission -Entity $rootFolder -Server $TargetServer -ErrorAction Stop
+        Write-LogDebug "Successfully read permissions on root folder"
+        
+        # Test if we have Administrator role or similar high-level access
+        $adminRoles = @("Administrator", "Admin")
+        $userPermissions = $testPermissions | Where-Object { $_.Principal -like "*$($currentUser.Split('\')[-1])*" -or $_.Principal -eq $currentUser }
+        
+        $hasAdminAccess = $false
+        foreach ($perm in $userPermissions) {
+            if ($adminRoles -contains $perm.Role) {
+                $hasAdminAccess = $true
+                Write-LogInfo "User has '$($perm.Role)' role - sufficient for permission management"
+                break
+            }
+        }
+        
+        if (-not $hasAdminAccess) {
+            Write-LogWarning "PRIVILEGE WARNING: Current user may not have sufficient privileges for permission modification"
+            Write-LogWarning "User '$currentUser' needs one of the following:"
+            Write-LogWarning "  1. Administrator role on vCenter"
+            Write-LogWarning "  2. Custom role with 'Authorization.ModifyPermissions' privilege"
+            Write-LogWarning "  3. Sufficient permissions on target VM folders"
+            Write-LogWarning "Common required privileges:"
+            Write-LogWarning "  - Global.Permissions (for global permission changes)"
+            Write-LogWarning "  - Authorization.ModifyPermissions (for folder-level changes)"
+            Write-LogWarning "  - Folder.ModifyPermissions (for VM folder access)"
+            
+            if (-not $WhatIf) {
+                Write-LogWarning "Consider running with -WhatIf first to identify potential issues"
+                Write-LogWarning "Or use -SkipMissingPrincipals to avoid permission creation failures"
+                Write-LogWarning "Or use -SkipPrivilegeErrors to skip permissions that fail due to insufficient privileges"
+            }
+        }
+        
+    } catch {
+        Write-LogWarning "Could not fully validate permission modification privileges: $($_.Exception.Message)"
+        Write-LogWarning "This may indicate insufficient privileges for permission management"
     }
     
     # Test PowerCLI version
@@ -1648,6 +1746,243 @@ function Export-MissingPrincipalsReport {
     } catch {
         $errorMsg = "Failed to export missing principals report to '$($FilePath)': $($_.Exception.Message)"
         Write-LogError $errorMsg
+    }
+}
+
+# Function to create a single missing principal in target vCenter
+function New-MissingPrincipal {
+    param(
+        [Parameter(Mandatory=$true)]
+        [object]$MissingPrincipal,
+        
+        [Parameter(Mandatory=$true)]
+        $TargetServer,
+        
+        [Parameter(Mandatory=$false)]
+        [string]$IdentitySourceDomain,
+        
+        [Parameter(Mandatory=$false)]
+        [switch]$CreateAsLocalAccount
+    )
+    
+    try {
+        $principalName = $MissingPrincipal.Principal
+        Write-LogInfo "Attempting to create missing principal: $principalName"
+        
+        if ($CreateAsLocalAccount) {
+            # Create as local SSO account
+            Write-LogInfo "Creating local SSO account for: $principalName"
+            
+            # Extract username from domain\user or user@domain format
+            $userName = $principalName
+            if ($principalName -like "*\*") {
+                $userName = $principalName.Split('\')[-1]
+            } elseif ($principalName -like "*@*") {
+                $userName = $principalName.Split('@')[0]
+            }
+            
+            try {
+                # Check if SSO Admin module is available
+                if (-not (Get-Module -ListAvailable -Name VMware.vSphere.SsoAdmin)) {
+                    Write-LogError "VMware.vSphere.SsoAdmin module not found. Cannot create local SSO accounts."
+                    return $false
+                }
+                
+                # Connect to SSO Admin
+                $ssoConnection = Connect-SsoAdminServer -Server $TargetServer.Name -User $TargetServer.User -Password $TargetServer.ExtensionData.SessionManager.AcquireCloneTicket() -SkipCertificateCheck
+                
+                if ($MissingPrincipal.PrincipalType -like "*Group*") {
+                    # Create local group
+                    $group = New-SsoGroup -Name $userName -Description "Created by permission copy script on $(Get-Date)" -Server $ssoConnection
+                    Write-LogInfo "Successfully created local SSO group: $userName"
+                } else {
+                    # Create local user
+                    $tempPassword = "TempP@ssw0rd$(Get-Random -Minimum 1000 -Maximum 9999)"
+                    $user = New-SsoPersonUser -UserName $userName -Password $tempPassword -Description "Created by permission copy script on $(Get-Date)" -Server $ssoConnection
+                    Write-LogInfo "Successfully created local SSO user: $userName (password must be changed)"
+                    Write-LogWarning "IMPORTANT: Password for $userName is set to temporary value and must be changed"
+                }
+                
+                Disconnect-SsoAdminServer -Server $ssoConnection
+                return $true
+                
+            } catch {
+                if ($_.Exception.Message -like "*authorization.modifypermissions*" -or 
+                    $_.Exception.Message -like "*folder-group-v1012:authorization.modifypermissions*") {
+                    Write-LogError "PRIVILEGE ERROR: Failed to create local SSO account for '$principalName'"
+                    Write-LogError "Required privileges missing: 'Authorization.ModifyPermissions'"
+                    Write-LogError "Solution options:"
+                    Write-LogError "  1. Run this script with Administrator role on vCenter"
+                    Write-LogError "  2. Create a custom role with 'Authorization.ModifyPermissions' privilege"
+                    Write-LogError "  3. Use -SkipPrivilegeErrors parameter to skip permission failures"
+                    Write-LogError "  4. Manually create the missing principals before running the script"
+                    
+                    if ($script:SkipPrivilegeErrors) {
+                        Write-LogWarning "Skipping principal creation due to privilege error (SkipPrivilegeErrors enabled)"
+                        return $false
+                    }
+                } else {
+                    Write-LogError "Failed to create local SSO account for '$principalName': $($_.Exception.Message)"
+                }
+                return $false
+            }
+            
+        } else {
+            # Add from external identity source
+            if (-not $IdentitySourceDomain) {
+                Write-LogError "IdentitySourceDomain parameter required when not creating local accounts"
+                return $false
+            }
+            
+            Write-LogInfo "Adding principal from external identity source: $principalName"
+            
+            try {
+                # Get the SSO admin connection
+                $ssoConnection = Connect-SsoAdminServer -Server $TargetServer.Name -User $TargetServer.User -Password $TargetServer.ExtensionData.SessionManager.AcquireCloneTicket() -SkipCertificateCheck
+                
+                # Get identity sources
+                $identitySources = Get-IdentitySource -Server $ssoConnection
+                $targetSource = $identitySources | Where-Object { $_.Name -eq $IdentitySourceDomain -or $_.Domains -contains $IdentitySourceDomain }
+                
+                if (-not $targetSource) {
+                    Write-LogError "Identity source '$IdentitySourceDomain' not found in target vCenter"
+                    Disconnect-SsoAdminServer -Server $ssoConnection
+                    return $false
+                }
+                
+                # Extract username from domain\user or user@domain format
+                $userName = $principalName
+                if ($principalName -like "*\*") {
+                    $userName = $principalName.Split('\')[-1]
+                } elseif ($principalName -like "*@*") {
+                    $userName = $principalName.Split('@')[0]
+                }
+                
+                if ($MissingPrincipal.PrincipalType -like "*Group*") {
+                    # Search and add group from external source
+                    $externalGroup = Get-SsoGroup -Name $userName -Domain $IdentitySourceDomain -Server $ssoConnection
+                    if ($externalGroup) {
+                        # Group exists in external source, just needs to be referenced in vCenter
+                        Write-LogInfo "Group '$userName' found in external identity source '$IdentitySourceDomain'"
+                        return $true
+                    } else {
+                        Write-LogError "Group '$userName' not found in external identity source '$IdentitySourceDomain'"
+                        return $false
+                    }
+                } else {
+                    # Search and add user from external source
+                    $externalUser = Get-SsoPersonUser -Name $userName -Domain $IdentitySourceDomain -Server $ssoConnection
+                    if ($externalUser) {
+                        # User exists in external source, just needs to be referenced in vCenter
+                        Write-LogInfo "User '$userName' found in external identity source '$IdentitySourceDomain'"
+                        return $true
+                    } else {
+                        Write-LogError "User '$userName' not found in external identity source '$IdentitySourceDomain'"
+                        return $false
+                    }
+                }
+                
+                Disconnect-SsoAdminServer -Server $ssoConnection
+                
+            } catch {
+                if ($_.Exception.Message -like "*authorization.modifypermissions*" -or 
+                    $_.Exception.Message -like "*folder-group-v1012:authorization.modifypermissions*") {
+                    Write-LogError "PRIVILEGE ERROR: Failed to add principal from external source '$principalName'"
+                    Write-LogError "Required privileges missing: 'Authorization.ModifyPermissions'"
+                    Write-LogError "Solution options:"
+                    Write-LogError "  1. Run this script with Administrator role on vCenter"
+                    Write-LogError "  2. Create a custom role with 'Authorization.ModifyPermissions' privilege"
+                    Write-LogError "  3. Use -SkipPrivilegeErrors parameter to skip permission failures"
+                    Write-LogError "  4. Manually create the missing principals before running the script"
+                    
+                    if ($script:SkipPrivilegeErrors) {
+                        Write-LogWarning "Skipping principal creation due to privilege error (SkipPrivilegeErrors enabled)"
+                        return $false
+                    }
+                } else {
+                    Write-LogError "Failed to add principal from external source '$principalName': $($_.Exception.Message)"
+                }
+                return $false
+            }
+        }
+        
+    } catch {
+        Write-LogError "Unexpected error creating principal '$($MissingPrincipal.Principal)': $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# Function to create all missing principals
+function New-AllMissingPrincipals {
+    param(
+        [Parameter(Mandatory=$true)]
+        $TargetServer,
+        
+        [Parameter(Mandatory=$false)]
+        [string]$IdentitySourceDomain,
+        
+        [Parameter(Mandatory=$false)]
+        [switch]$CreateAsLocalAccounts
+    )
+    
+    if (-not $script:MissingPrincipals -or $script:MissingPrincipals.Count -eq 0) {
+        Write-LogInfo "No missing principals to create"
+        return
+    }
+    
+    Write-LogInfo "==================================================================="
+    Write-LogInfo "CREATING MISSING PRINCIPALS"
+    Write-LogInfo "==================================================================="
+    Write-LogInfo "Total missing principals to create: $($script:MissingPrincipals.Count)"
+    
+    if ($CreateAsLocalAccounts) {
+        Write-LogInfo "Creation mode: Local SSO accounts"
+    } else {
+        Write-LogInfo "Creation mode: External identity source"
+        Write-LogInfo "Identity source domain: $IdentitySourceDomain"
+    }
+    
+    $successCount = 0
+    $failureCount = 0
+    $skipCount = 0
+    
+    foreach ($missingPrincipal in $script:MissingPrincipals) {
+        Write-LogInfo "Processing principal $($script:MissingPrincipals.IndexOf($missingPrincipal) + 1) of $($script:MissingPrincipals.Count): $($missingPrincipal.Principal)"
+        
+        # Skip computer accounts and SIDs
+        if ($missingPrincipal.PrincipalType -eq "Computer Account" -or $missingPrincipal.Principal -like "S-1-*") {
+            Write-LogWarning "Skipping $($missingPrincipal.PrincipalType): $($missingPrincipal.Principal) - Cannot be created automatically"
+            $skipCount++
+            continue
+        }
+        
+        $result = New-MissingPrincipal -MissingPrincipal $missingPrincipal -TargetServer $TargetServer -IdentitySourceDomain $IdentitySourceDomain -CreateAsLocalAccount:$CreateAsLocalAccounts
+        
+        if ($result) {
+            $successCount++
+            Write-LogInfo "Successfully processed principal: $($missingPrincipal.Principal)"
+        } else {
+            $failureCount++
+            if (-not $script:SkipPrivilegeErrors) {
+                Write-LogError "Failed to create principal: $($missingPrincipal.Principal)"
+            }
+        }
+        
+        # Add small delay to avoid overwhelming the API
+        Start-Sleep -Milliseconds 500
+    }
+    
+    Write-LogInfo "==================================================================="
+    Write-LogInfo "PRINCIPAL CREATION SUMMARY"
+    Write-LogInfo "==================================================================="
+    Write-LogInfo "Successfully created: $successCount"
+    Write-LogInfo "Failed to create: $failureCount"
+    Write-LogInfo "Skipped (Computer/SID): $skipCount"
+    Write-LogInfo "Total processed: $($script:MissingPrincipals.Count)"
+    
+    if ($failureCount -gt 0 -and -not $script:SkipPrivilegeErrors) {
+        Write-LogWarning "Some principals could not be created. Review the log for details."
+        Write-LogWarning "Consider using -SkipPrivilegeErrors to continue despite privilege errors"
     }
 }
 
@@ -1835,6 +2170,22 @@ try {
     
     if ($ExportMissingPrincipals) {
         Export-MissingPrincipalsReport -FilePath $MissingPrincipalsReportPath
+    }
+    
+    # Create missing principals if requested
+    if ($CreateMissingPrincipals -and $script:MissingPrincipals.Count -gt 0) {
+        Write-LogInfo "==================================================================="
+        Write-LogInfo "PRINCIPAL CREATION PHASE"
+        Write-LogInfo "==================================================================="
+        
+        if ($WhatIf) {
+            Write-LogInfo "WhatIf Mode: Would create $($script:MissingPrincipals.Count) missing principals"
+            foreach ($principal in $script:MissingPrincipals) {
+                Write-LogInfo "  Would create: $($principal.Principal) ($($principal.PrincipalType))"
+            }
+        } else {
+            New-AllMissingPrincipals -TargetServer $targetVIServer -IdentitySourceDomain $IdentitySourceDomain -CreateAsLocalAccounts:$CreateAsLocalAccounts
+        }
     }
 
 } catch {
